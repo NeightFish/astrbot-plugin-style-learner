@@ -1,0 +1,533 @@
+"""
+AstrBot Style Learner - 学习他人说话风格并模仿回复的插件
+
+命令列表:
+  /sklearn <技能名> <文件路径>  从 .jsonl 文件学习风格
+  /sklist                       列出所有已学技能
+  /imitate <技能名> <消息>      以指定风格回复
+  /skdelete <技能名>            删除一个技能
+  /skinfo <技能名>              查看技能详情
+  /skupdate <技能名> [新路径]   更新技能
+
+/imitate 支持风格混合: /imitate 技能1:0.3+技能2:0.7 消息内容
+
+输入数据格式: .jsonl 文件，每行 ["句子1", "句子2", ...]
+
+--- 本插件由 AI (DeepSeek-V4-Pro) 生成 ---
+"""
+
+import asyncio
+import json
+import random
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star, register
+from astrbot.core.star.config import put_config
+
+try:
+    from openai import AsyncOpenAI
+
+    HAS_OPENAI = True
+except ImportError:
+    AsyncOpenAI = None
+    HAS_OPENAI = False
+
+PLUGIN_NAMESPACE = "astrbot_plugin_style_learner"
+FEEDBACK_LOG = "feedback_log.jsonl"
+
+
+@register(PLUGIN_NAMESPACE, "AI (DeepSeek-V4-Pro)",
+          "从对话记录学习说话风格，支持风格混合与模仿回复", "1.0.0")
+class StyleLearner(Star):
+
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
+        super().__init__(context)
+        self.config = config
+        self.plugin_dir = Path(__file__).parent
+        self.skills_file = self.plugin_dir / "skills.json"
+        self.feedback_file = self.plugin_dir / FEEDBACK_LOG
+        self._skills_lock = asyncio.Lock()
+        self._skills: dict[str, dict] = {}
+        self._register_config()
+
+    # ==================== Config ====================
+
+    def _register_config(self):
+        put_config(PLUGIN_NAMESPACE, "DeepSeek API Key", "deepseek_api_key", "",
+                   "DeepSeek API 密钥（必填）")
+        put_config(PLUGIN_NAMESPACE, "DeepSeek Model", "deepseek_model",
+                   "deepseek-chat", "使用的 DeepSeek 模型名称")
+        put_config(PLUGIN_NAMESPACE, "DeepSeek Base URL", "deepseek_base_url",
+                   "https://api.deepseek.com", "DeepSeek API 地址")
+        put_config(PLUGIN_NAMESPACE, "Max Sample Chars", "max_sample_chars",
+                   3000, "学习时单次分析最大字符数")
+
+    def _cfg(self, key, default=None):
+        if self.config and hasattr(self.config, key):
+            v = getattr(self.config, key)
+            if v is not None:
+                return v
+        return default
+
+    # ==================== Lifecycle ====================
+
+    async def initialize(self):
+        await self._load_skills()
+        logger.info(f"[StyleLearner] 已加载 {len(self._skills)} 个技能")
+
+    async def terminate(self):
+        pass
+
+    # ==================== Persistence ====================
+
+    async def _load_skills(self):
+        async with self._skills_lock:
+            try:
+                if self.skills_file.exists():
+                    raw = await asyncio.to_thread(
+                        self.skills_file.read_text, encoding="utf-8")
+                    self._skills = json.loads(raw)
+                else:
+                    self._skills = {}
+            except Exception as e:
+                logger.error(f"[StyleLearner] 加载 skills.json 失败: {e}")
+                self._skills = {}
+
+    async def _save_skills(self):
+        async with self._skills_lock:
+            try:
+                data = json.dumps(self._skills, ensure_ascii=False, indent=2)
+                await asyncio.to_thread(
+                    self.skills_file.write_text, data, encoding="utf-8")
+            except Exception as e:
+                logger.error(f"[StyleLearner] 保存 skills.json 失败: {e}")
+
+    # ==================== LLM ====================
+
+    def _get_client(self):
+        if not HAS_OPENAI:
+            raise RuntimeError("请安装 openai 库: pip install openai")
+        api_key = self._cfg("deepseek_api_key", "")
+        if not api_key:
+            raise RuntimeError("请先在插件配置中设置 deepseek_api_key")
+        base_url = self._cfg("deepseek_base_url", "https://api.deepseek.com")
+        return AsyncOpenAI(api_key=api_key, base_url=base_url)
+
+    async def _call_llm(self, system_prompt: str, user_prompt: str,
+                        max_tokens: int = 1024, temperature: float = 0.7) -> str:
+        model = self._cfg("deepseek_model", "deepseek-chat")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                client = self._get_client()
+                resp = await client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                return resp.choices[0].message.content or ""
+            except Exception as e:
+                delay = 2 ** attempt
+                logger.warning(
+                    f"[StyleLearner] API 重试 {attempt+1}/{max_retries}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(delay)
+                else:
+                    raise RuntimeError(f"API 调用失败: {e}")
+        return ""
+
+    # ==================== /sklearn ====================
+
+    @filter.command("sklearn")
+    async def sklearn(self, event: AstrMessageEvent):
+        """从 .jsonl 文件学习风格。用法: /sklearn <技能名> <文件路径>"""
+        msg = event.get_message_str().strip()
+        args = msg[len("/sklearn"):].strip().split(" ", 1)
+        if len(args) < 2 or not args[0] or not args[1]:
+            yield event.plain_result(
+                "用法: /sklearn <技能名> <文件路径>\n"
+                "例如: /sklearn 温柔学姐 D:/data/style.jsonl")
+            return
+
+        skill_name = args[0]
+        file_path = args[1].strip()
+
+        if skill_name in self._skills:
+            yield event.plain_result(
+                f"技能 [{skill_name}] 已存在。\n"
+                f"如需重新学习请先用 /skdelete {skill_name} 删除。")
+            return
+
+        path = Path(file_path)
+        if not path.exists():
+            yield event.plain_result(f"文件不存在: {file_path}")
+            return
+
+        yield event.plain_result(f"正在分析 [{skill_name}] 的对话风格，请稍候...")
+
+        try:
+            conversations = await self._read_jsonl(path)
+            if not conversations:
+                yield event.plain_result("文件中没有有效的对话数据（每行需为长度>=2的JSON数组）")
+                return
+
+            sampled = self._sample_conversations(conversations)
+            sample_text = self._format_samples(sampled)
+            result = await self._analyze_style(sample_text)
+
+            skill = {
+                "label": result.get("label", skill_name),
+                "summary": result.get("summary", ""),
+                "examples": sampled[:10],
+                "source_file": str(path.absolute()),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+            self._skills[skill_name] = skill
+            await self._save_skills()
+
+            yield event.plain_result(
+                f"技能 [{skill_name}] 学习完成！\n"
+                f"风格标签: {skill['label']}\n"
+                f"风格描述: {skill['summary']}")
+        except Exception as e:
+            logger.error(f"[StyleLearner] /sklearn 失败: {e}", exc_info=True)
+            yield event.plain_result(f"学习失败: {e}")
+
+    # ==================== /sklist ====================
+
+    @filter.command("sklist")
+    async def sklist(self, event: AstrMessageEvent):
+        """列出所有已学习的技能。"""
+        if not self._skills:
+            yield event.plain_result(
+                "暂无已学习的技能。使用 /sklearn <技能名> <文件路径> 开始学习。")
+            return
+
+        lines = ["已学习的技能:\n"]
+        for name, skill in self._skills.items():
+            label = skill.get("label", "未标注")
+            created = skill.get("created_at", "未知")[:10]
+            lines.append(f"  [{name}] {label} (创建于 {created})")
+
+        yield event.plain_result("\n".join(lines))
+
+    # ==================== /imitate ====================
+
+    @filter.command("imitate")
+    async def imitate(self, event: AstrMessageEvent):
+        """模仿指定风格回复。用法: /imitate <技能名> <消息>
+        支持风格混合: /imitate 技能1:0.3+技能2:0.7 消息
+        """
+        msg = event.get_message_str().strip()
+        rest = msg[len("/imitate"):].strip()
+        parts = rest.split(" ", 1)
+        if len(parts) < 2:
+            yield event.plain_result(
+                "用法: /imitate <技能名> <消息>\n"
+                "例如: /imitate 温柔学姐 今天天气真好\n"
+                "支持混合: /imitate 温柔学姐:0.3+沙雕群友:0.7 你好呀")
+            return
+
+        spec = parts[0]
+        message = parts[1]
+
+        skill_refs = self._parse_skill_spec(spec)
+        if not skill_refs:
+            yield event.plain_result("无效的技能指定格式。")
+            return
+
+        for name, _ in skill_refs:
+            if name not in self._skills:
+                yield event.plain_result(
+                    f"技能 [{name}] 不存在。使用 /sklist 查看可用技能。")
+                return
+
+        try:
+            system_prompt = self._build_imitation_prompt(skill_refs, message)
+            response = await self._call_llm(
+                system_prompt=system_prompt,
+                user_prompt=message,
+                max_tokens=200,
+                temperature=0.9,
+            )
+
+            # Log feedback opportunity (user can reply to correct)
+            await self._log_feedback(skill_refs, message, response)
+
+            yield event.plain_result(response)
+
+        except Exception as e:
+            logger.error(f"[StyleLearner] /imitate 失败: {e}", exc_info=True)
+            yield event.plain_result(f"模仿失败: {e}")
+
+    def _parse_skill_spec(self, spec: str) -> list[tuple[str, float]]:
+        """解析技能与权重: 'name' 或 'a:0.3+b:0.7'"""
+        result = []
+        for part in spec.split("+"):
+            part = part.strip()
+            if ":" in part:
+                name, w_str = part.rsplit(":", 1)
+                try:
+                    w = float(w_str)
+                except ValueError:
+                    w = 1.0
+            else:
+                name = part
+                w = 1.0
+            name = name.strip()
+            if name:
+                result.append((name, w))
+        return result
+
+    def _build_imitation_prompt(
+            self, skill_refs: list[tuple[str, float]], _message: str) -> str:
+        """构造模仿 System Prompt，支持单技能和混合风格。"""
+        parts = [
+            "你现在要扮演一个角色，请严格遵循以下风格描述进行回复。"
+            "不要跳出角色，不要解释自己是AI，直接给出回复内容。"
+        ]
+
+        if len(skill_refs) == 1:
+            name, _ = skill_refs[0]
+            skill = self._skills[name]
+            parts.append(f"\n【角色风格】\n{skill['summary']}")
+
+            # 向量检索：从示例中选最相关的（语义相关度用简单关键词匹配近似）
+            examples = skill.get("examples", [])
+            if examples:
+                # 随机选取 3 条作为参考（有 sentence-transformers 时可升级为语义检索）
+                picked = random.sample(examples, min(3, len(examples)))
+                parts.append("\n【对话示例】")
+                for ex in picked:
+                    if len(ex) >= 2:
+                        parts.append(f"用户: {ex[0]}")
+                        parts.append(f"角色: {ex[-1]}")
+        else:
+            parts.append("\n【混合风格】")
+            total_w = sum(w for _, w in skill_refs) or 1.0
+            for name, w in skill_refs:
+                skill = self._skills[name]
+                pct = int(w / total_w * 100)
+                parts.append(
+                    f"\n{pct}% {skill.get('label', name)} 风格: {skill['summary']}")
+
+        return "\n".join(parts)
+
+    async def _log_feedback(self, skill_refs: list[tuple[str, float]],
+                            message: str, response: str):
+        """记录模仿输出到反馈日志，供后续手动优化。"""
+        def _write():
+            with self.feedback_file.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "skills": [(n, w) for n, w in skill_refs],
+                    "user_message": message,
+                    "bot_response": response,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }, ensure_ascii=False) + "\n")
+        try:
+            await asyncio.to_thread(_write)
+        except Exception as e:
+            logger.debug(f"[StyleLearner] 反馈日志写入失败: {e}")
+
+    # ==================== /skdelete ====================
+
+    @filter.command("skdelete")
+    async def skdelete(self, event: AstrMessageEvent):
+        """删除一个技能。用法: /skdelete <技能名>"""
+        msg = event.get_message_str().strip()
+        name = msg[len("/skdelete"):].strip()
+        if not name:
+            yield event.plain_result("用法: /skdelete <技能名>")
+            return
+
+        if name not in self._skills:
+            yield event.plain_result(f"技能 [{name}] 不存在。")
+            return
+
+        del self._skills[name]
+        await self._save_skills()
+        yield event.plain_result(f"技能 [{name}] 已删除。")
+
+    # ==================== /skinfo ====================
+
+    @filter.command("skinfo")
+    async def skinfo(self, event: AstrMessageEvent):
+        """查看技能详情。用法: /skinfo <技能名>"""
+        msg = event.get_message_str().strip()
+        name = msg[len("/skinfo"):].strip()
+        if not name:
+            yield event.plain_result("用法: /skinfo <技能名>")
+            return
+
+        if name not in self._skills:
+            yield event.plain_result(
+                f"技能 [{name}] 不存在。使用 /sklist 查看可用技能。")
+            return
+
+        skill = self._skills[name]
+        info = (
+            f"【{name}】\n"
+            f"风格标签: {skill.get('label', '未知')}\n"
+            f"风格描述: {skill.get('summary', '无')}\n"
+            f"来源文件: {skill.get('source_file', '未知')}\n"
+            f"创建时间: {skill.get('created_at', '未知')[:10]}\n"
+            f"示例数量: {len(skill.get('examples', []))} 条"
+        )
+        yield event.plain_result(info)
+
+    # ==================== /skupdate ====================
+
+    @filter.command("skupdate")
+    async def skupdate(self, event: AstrMessageEvent):
+        """更新一个技能。用法: /skupdate <技能名> [新文件路径]"""
+        msg = event.get_message_str().strip()
+        args = msg[len("/skupdate"):].strip().split(" ", 1)
+        if not args or not args[0]:
+            yield event.plain_result(
+                "用法: /skupdate <技能名> [新文件路径]")
+            return
+
+        skill_name = args[0]
+        if skill_name not in self._skills:
+            yield event.plain_result(f"技能 [{skill_name}] 不存在。")
+            return
+
+        if len(args) > 1:
+            file_path = args[1].strip()
+        else:
+            file_path = self._skills[skill_name].get("source_file", "")
+            if not file_path:
+                yield event.plain_result(
+                    f"技能 [{skill_name}] 没有记录源文件路径，请指定文件路径。")
+                return
+
+        path = Path(file_path)
+        if not path.exists():
+            yield event.plain_result(f"文件不存在: {file_path}")
+            return
+
+        yield event.plain_result(f"正在更新 [{skill_name}]，请稍候...")
+
+        try:
+            conversations = await self._read_jsonl(path)
+            if not conversations:
+                yield event.plain_result("文件中没有有效的对话数据")
+                return
+
+            sampled = self._sample_conversations(conversations)
+            sample_text = self._format_samples(sampled)
+            result = await self._analyze_style(sample_text)
+
+            self._skills[skill_name].update({
+                "label": result.get("label",
+                                   self._skills[skill_name].get("label", skill_name)),
+                "summary": result.get("summary", ""),
+                "examples": sampled[:10],
+                "source_file": str(path.absolute()),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+            await self._save_skills()
+
+            yield event.plain_result(
+                f"技能 [{skill_name}] 更新完成！\n"
+                f"风格标签: {self._skills[skill_name]['label']}\n"
+                f"风格描述: {self._skills[skill_name]['summary']}")
+        except Exception as e:
+            logger.error(f"[StyleLearner] /skupdate 失败: {e}", exc_info=True)
+            yield event.plain_result(f"更新失败: {e}")
+
+    # ==================== Helpers ====================
+
+    async def _read_jsonl(self, path: Path) -> list[list[str]]:
+        conversations = []
+        try:
+            if path.suffix == ".gz":
+                import gzip
+                raw = await asyncio.to_thread(
+                    lambda: gzip.decompress(path.read_bytes()).decode("utf-8"))
+            else:
+                raw = await asyncio.to_thread(path.read_text, encoding="utf-8")
+
+            for line in raw.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, list) and len(data) >= 2:
+                        # Handle LCCC format: [[s1,s2], [s3,s4], ...]
+                        if all(isinstance(x, list) for x in data):
+                            flat = []
+                            for item in data:
+                                if isinstance(item, list):
+                                    flat.extend(item)
+                                else:
+                                    flat.append(item)
+                            if len(flat) >= 2:
+                                conversations.append(flat)
+                        else:
+                            conversations.append(data)
+                except json.JSONDecodeError:
+                    continue
+        except Exception as e:
+            logger.error(f"[StyleLearner] 读取文件失败: {e}")
+        return conversations
+
+    def _sample_conversations(self, conversations: list[list[str]]) -> list[list[str]]:
+        max_chars = int(self._cfg("max_sample_chars", 3000))
+        max_count = min(len(conversations), 50)
+
+        pool = conversations.copy()
+        random.shuffle(pool)
+
+        result = []
+        total = 0
+        for conv in pool[:max_count]:
+            text = "|||".join(conv)
+            if total + len(text) > max_chars and result:
+                break
+            result.append(conv)
+            total += len(text)
+
+        return result
+
+    def _format_samples(self, conversations: list[list[str]]) -> str:
+        return "\n".join("|||".join(c) for c in conversations)
+
+    async def _analyze_style(self, sample_text: str) -> dict:
+        system_prompt = (
+            "你是一个专业的对话风格分析师。仔细阅读对话样本，总结说话人的语言风格。"
+            "只输出JSON，不要包含其他内容。"
+        )
+        user_prompt = (
+            "以下是同一个人的多段对话记录，请总结该说话人的语言风格。\n\n"
+            "要求：\n"
+            "1. 起一个简洁的中文风格标签（如\"温柔学姐\"、\"幽默吐槽\"等）。\n"
+            "2. 用一段话（100字以内）描述风格：语气特征、常用语气词、句子长度、"
+            "表情符号习惯、常见话题等。\n\n"
+            f"对话样本：\n{sample_text}\n\n"
+            "输出JSON: {\"label\": \"风格标签\", \"summary\": \"风格描述\"}"
+        )
+
+        response = await self._call_llm(
+            system_prompt, user_prompt, max_tokens=512, temperature=0.7)
+
+        try:
+            m = re.search(r'\{.*\}', response, re.DOTALL)
+            if m:
+                return json.loads(m.group())
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        logger.warning(f"[StyleLearner] 无法解析风格JSON: {response[:200]}")
+        return {"label": "未知风格", "summary": response[:200]}
