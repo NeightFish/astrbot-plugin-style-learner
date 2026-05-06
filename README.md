@@ -7,15 +7,16 @@
 ## 功能
 
 - 从 `.jsonl` 对话文件自动分析并提取说话风格
+- **持续扮演**：开启后 bot 持续以指定风格回复，无需每次手动 `/imitate`
 - **主动学习**：在日常聊天中自动积累对话数据，无需手动导入文件
+- **智能示例检索**：jieba + TF-IDF 自动匹配最相关的对话示例，提升模仿质量
 - 支持风格混合（多个风格按权重组合）
-- 消息过滤：防止敏感信息污染数据集（默认开启，可自定义关键词）
-- 自动记录模仿输出到反馈日志，方便后续优化
+- 消息过滤：防止敏感信息污染数据集
+- 使用统计与排行
+- 技能重命名与合并
 - 所有配置通过 AstrBot WebUI 暴露，开箱即用
 
 ## 安装
-
-1. 将本仓库克隆到 AstrBot 的插件目录：
 
 ```bash
 cd AstrBot/data/plugins
@@ -33,14 +34,32 @@ pip install -r requirements.txt
 | 命令 | 用法 | 说明 |
 |------|------|------|
 | `/sklearn` | `/sklearn <技能名> <文件路径>` | 从 `.jsonl` 文件学习风格 |
-| `/sklist` | `/sklist` | 列出所有已学习的技能 |
-| `/imitate` | `/imitate <技能名> <消息>` | 以指定风格回复消息 |
+| `/sklist` | `/sklist` | 列出所有已学技能及使用次数 |
+| `/imitate` | `/imitate <技能名> <消息>` | 一次性模仿 |
+| `/imitate` | `/imitate <技能名> --on` | 开启持续扮演 |
+| `/imitate` | `/imitate --off` | 关闭持续扮演 |
+| `/imitate` | `/imitate --status` | 查看当前扮演状态 |
 | `/skdelete` | `/skdelete <技能名>` | 删除一个技能 |
-| `/skinfo` | `/skinfo <技能名>` | 查看技能详情（标签、描述、示例数等） |
-| `/skupdate` | `/skupdate <技能名> [新路径]` | 更新技能（不指定路径则用原文件） |
-| `/sklearn_active` | `/sklearn_active <技能名> [数量]` | 从聊天 buffer 手动创建技能 |
+| `/skinfo` | `/skinfo <技能名>` | 查看技能详情 |
+| `/skupdate` | `/skupdate <技能名> [新路径]` | 更新技能 |
+| `/skrename` | `/skrename <旧名> <新名>` | 重命名技能 |
+| `/skmerge` | `/skmerge <技能A> <技能B> <新名>` | 合并两个技能 |
+| `/skstats` | `/skstats` | 查看使用排行 |
+| `/sklearn_active` | `/sklearn_active <技能名> [数量]` | 从 buffer 手动创建技能 |
 | `/skbuffer` | `/skbuffer` | 查看 buffer 积累状态 |
 | `/skbuffer_clear` | `/skbuffer_clear` | 清空 buffer |
+
+### 持续扮演
+
+开启后，bot 在该会话中会持续以指定风格回复，无需每次输入 `/imitate`：
+
+```bash
+/imitate 温柔学姐 --on        # 开启：后续消息自动以温柔学姐风格回复
+/imitate --status             # 查看当前扮演状态
+/imitate --off                # 关闭
+```
+
+也可以设**默认风格**（WebUI → `默认风格`），让 bot 对所有消息自动应用该风格。
 
 ### 风格混合
 
@@ -48,6 +67,12 @@ pip install -r requirements.txt
 
 ```
 /imitate 温柔学姐:0.3+沙雕群友:0.7 今天天气真好
+```
+
+### 技能合并
+
+```
+/skmerge 温柔学姐 沙雕群友 混合风格
 ```
 
 ## 主动学习
@@ -58,40 +83,9 @@ pip install -r requirements.txt
 
 | 模式 | 说明 |
 |------|------|
-| `off` (关闭) | 不做主动学习，仅响应手动命令 |
+| `off` (关闭) | 不做主动学习 |
 | `all` (学习所有人) | 收集所有用户消息，创建技能 `@全局` |
 | `specific` (指定用户) | 仅收集指定 QQ 号的消息，创建技能 `@<QQ号>` |
-
-### 消息过滤
-
-为防止涉政、色情等敏感内容污染数据集，插件内置关键词过滤（默认开启）。
-
-在 WebUI 中可：
-- 关闭过滤（`启用消息过滤` → false）
-- 自定义关键词列表（`过滤关键词`，逗号分隔）
-- 开启语义审核（`语义审核 Prompt`，填写后每次分析前调 DeepSeek 审核，消耗 token）
-
-### 使用示例
-
-```bash
-# 在 WebUI 中将 主动学习模式 设为 all
-# 然后正常聊天...
-
-# 查看 buffer 积累进度
-/skbuffer
-# → 主动学习模式: all
-# → 目标技能名: @全局
-# → Buffer 总量: 25 / 自动分析阈值: 30
-# → 按发送者统计:
-# →   12345678: 15 条
-# →   87654321: 10 条
-
-# 满了自动分析，或手动触发
-/sklearn_active @全局 30
-
-# 模仿学到的全局风格
-/imitate @全局 你在干嘛呢
-```
 
 ## 数据格式
 
@@ -102,20 +96,6 @@ pip install -r requirements.txt
 ["今天天气真好", "是呀，适合出去走走。"]
 ```
 
-- 每行至少包含 2 个句子（至少一轮对话）
-- 支持嵌套数组格式（如 LCCC 数据集）
-
-### 示例：使用 LCCC 数据集
-
-```bash
-# 解压
-gunzip lccc_base_test.jsonl.gz
-
-# 在聊天中使用
-/sklearn 微博风格 D:/datasets/lccc/lccc_base_test.jsonl
-/imitate 微博风格 你在干嘛呢
-```
-
 ## 配置项
 
 | 配置项 | 默认值 | 说明 |
@@ -124,6 +104,7 @@ gunzip lccc_base_test.jsonl.gz
 | `deepseek_model` | `deepseek-chat` | 使用的模型名称 |
 | `deepseek_base_url` | `https://api.deepseek.com` | API 地址 |
 | `max_sample_chars` | `3000` | 学习时单次最大采样字符数 |
+| `default_skill` | (空) | 默认风格技能名，填写后自动应用 |
 | `active_learning_mode` | `off` | 主动学习模式: off / all / specific |
 | `specific_qq` | (空) | specific 模式下指定的 QQ 号 |
 | `batch_size` | `30` | buffer 满多少条后自动分析 |
