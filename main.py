@@ -2,16 +2,20 @@
 AstrBot Style Learner - 学习他人说话风格并模仿回复的插件
 
 命令列表:
-  /sklearn <技能名> <文件路径>  从 .jsonl 文件学习风格
-  /sklist                       列出所有已学技能
-  /imitate <技能名> <消息>      以指定风格回复
-  /skdelete <技能名>            删除一个技能
-  /skinfo <技能名>              查看技能详情
-  /skupdate <技能名> [新路径]   更新技能
+  /sklearn <技能名> <文件路径>    从 .jsonl 文件学习风格
+  /sklist                         列出所有已学技能
+  /imitate <技能名> <消息>        以指定风格回复
+  /skdelete <技能名>              删除一个技能
+  /skinfo <技能名>                查看技能详情
+  /skupdate <技能名> [新路径]     更新技能
+  /sklearn_active <技能名> [数量] 从 buffer 手动创建技能
+  /skbuffer                       查看 buffer 状态
+  /skbuffer_clear                 清空 buffer
 
 /imitate 支持风格混合: /imitate 技能1:0.3+技能2:0.7 消息内容
 
 输入数据格式: .jsonl 文件，每行 ["句子1", "句子2", ...]
+主动学习: 开启后自动从日常聊天积累对话数据
 
 --- 本插件由 AI (DeepSeek-V4-Pro) 生成 ---
 """
@@ -20,6 +24,7 @@ import asyncio
 import json
 import random
 import re
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -50,8 +55,14 @@ class StyleLearner(Star):
         self.plugin_dir = Path(__file__).parent
         self.skills_file = self.plugin_dir / "skills.json"
         self.feedback_file = self.plugin_dir / FEEDBACK_LOG
+        self.buffer_file = self.plugin_dir / "active_buffer.jsonl"
         self._skills_lock = asyncio.Lock()
         self._skills: dict[str, dict] = {}
+        # 主动学习: ring buffer (max 200 turns)
+        self._buffer: deque[dict] = deque(maxlen=200)
+        # pending: session_id → (user_msg, sender_id) (等待 bot 回复后配对)
+        self._pending: dict[str, tuple[str, str]] = {}
+        self._last_auto_analyze_count: int = 0
         self._register_config()
 
     # ==================== Config ====================
@@ -66,6 +77,26 @@ class StyleLearner(Star):
         put_config(PLUGIN_NAMESPACE, "Max Sample Chars", "max_sample_chars",
                    3000, "学习时单次分析最大字符数")
 
+        # 主动学习
+        put_config(PLUGIN_NAMESPACE, "主动学习模式", "active_learning_mode",
+                   "off", "off=关闭 / all=学习所有人 / specific=学习指定用户")
+        put_config(PLUGIN_NAMESPACE, "指定学习QQ号", "specific_qq",
+                   "", "当主动学习模式为 specific 时，指定要学习的 QQ 号")
+        put_config(PLUGIN_NAMESPACE, "自动分析阈值", "batch_size",
+                   30, "缓冲区满多少条后自动触发风格分析")
+
+        # 消息过滤
+        put_config(PLUGIN_NAMESPACE, "启用消息过滤", "enable_message_filter",
+                   True, "是否过滤涉政/色色等敏感消息，防止污染数据集")
+        put_config(PLUGIN_NAMESPACE, "过滤关键词", "filter_keywords",
+                   "习近平,习总书记,国务院,共产党,台独,港独,六四,法轮功,"
+                   "裸体,做爱,性交,色情,黄色,成人网站,赌博,赌场",
+                   "敏感词列表，逗号分隔。命中任意关键词的消息将被跳过")
+        put_config(PLUGIN_NAMESPACE, "语义审核 Prompt", "filter_prompt",
+                   "", "留空则不启用。填写后每次分析前调 DeepSeek 做语义审核，消耗 token")
+        put_config(PLUGIN_NAMESPACE, "显示隐私提示", "show_filter_notice",
+                   False, "开启后在 WebUI 显示隐私提示文字")
+
     def _cfg(self, key, default=None):
         if self.config and hasattr(self.config, key):
             v = getattr(self.config, key)
@@ -77,10 +108,179 @@ class StyleLearner(Star):
 
     async def initialize(self):
         await self._load_skills()
-        logger.info(f"[StyleLearner] 已加载 {len(self._skills)} 个技能")
+        await self._load_buffer()
+        logger.info(
+            f"[StyleLearner] 已加载 {len(self._skills)} 个技能, "
+            f"buffer 中有 {len(self._buffer)} 条对话")
 
     async def terminate(self):
         pass
+
+    # ==================== Active Learning ====================
+
+    def _active_skill_name(self) -> str | None:
+        """根据当前模式返回主动学习的技能名，返回 None 表示不启用"""
+        mode = self._cfg("active_learning_mode", "off")
+        if mode == "off":
+            return None
+        if mode == "specific":
+            qq = self._cfg("specific_qq", "").strip()
+            return f"@{qq}" if qq else None
+        if mode == "all":
+            return "@全局"
+        return None
+
+    def _should_learn_from(self, sender_id: str) -> bool:
+        """判断是否应该学习该发送者的消息"""
+        mode = self._cfg("active_learning_mode", "off")
+        if mode == "off":
+            return False
+        if mode == "all":
+            return True
+        if mode == "specific":
+            target = self._cfg("specific_qq", "").strip()
+            return target and sender_id == target
+        return False
+
+    def _filter_message(self, msg: str) -> bool:
+        """消息过滤。返回 True 表示应该跳过（被过滤）。
+        只有启用过滤且消息命中关键词时才返回 True。
+        """
+        if not self._cfg("enable_message_filter", True):
+            return False
+        keywords = self._cfg("filter_keywords", "")
+        if not keywords or not isinstance(keywords, str):
+            return False
+        msg_lower = msg.lower()
+        for kw in keywords.split(","):
+            kw = kw.strip()
+            if kw and kw.lower() in msg_lower:
+                logger.debug(f"[StyleLearner] 消息被过滤，命中关键词: {kw}")
+                return True
+        return False
+
+    @filter.on_llm_request()
+    async def _on_llm_request(self, event: AstrMessageEvent, req):
+        """被动监听：捕获用户消息，暂存到 pending 等待 bot 回复后配对"""
+        skill_name = self._active_skill_name()
+        if not skill_name:
+            return
+
+        sender_id = event.get_sender_id()
+        if not self._should_learn_from(sender_id):
+            return
+
+        user_msg = event.get_message_str().strip()
+        if not user_msg:
+            return
+
+        if self._filter_message(user_msg):
+            return
+
+        # 暂存到 pending，等 on_after_message_sent 时配对
+        session_id = event.get_session_id()
+        self._pending[session_id] = (user_msg, sender_id)
+
+    @filter.after_message_sent()
+    async def _on_after_message_sent(self, event: AstrMessageEvent):
+        """被动监听：bot 回复后，与 pending 中的用户消息配对写入 buffer"""
+        skill_name = self._active_skill_name()
+        if not skill_name:
+            return
+
+        session_id = event.get_session_id()
+        pending = self._pending.pop(session_id, None)
+        if not pending:
+            return
+        user_msg, sender_id = pending
+
+        bot_msg = event.get_message_str()
+        if not bot_msg:
+            return
+
+        item = {
+            "sender": sender_id,
+            "user_msg": user_msg,
+            "bot_msg": bot_msg,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._buffer.append(item)
+        await self._save_buffer_item(item)
+
+        # 检查是否达到自动分析阈值（节流：至少增长 batch_size/2 才再次触发）
+        batch_size = int(self._cfg("batch_size", 30))
+        if len(self._buffer) >= batch_size and \
+                len(self._buffer) - self._last_auto_analyze_count >= max(batch_size // 2, 5):
+            self._last_auto_analyze_count = len(self._buffer)
+            await self._auto_analyze(skill_name)
+
+    async def _auto_analyze(self, skill_name: str):
+        """从 buffer 采样并自动创建/更新技能"""
+        if len(self._buffer) < 10:
+            return
+
+        try:
+            # 从 buffer 提取对话采样
+            pool = list(self._buffer)
+            random.shuffle(pool)
+            sampled = []
+            total_chars = 0
+            max_chars = int(self._cfg("max_sample_chars", 3000))
+            for item in pool[:50]:
+                text = f"{item['user_msg']}|||{item['bot_msg']}"
+                if total_chars + len(text) > max_chars and sampled:
+                    break
+                sampled.append([item["user_msg"], item["bot_msg"]])
+                total_chars += len(text)
+
+            sample_text = "\n".join(
+                f"{s[0]}|||{s[1]}" for s in sampled)
+
+            # 可选的语义审核
+            filter_prompt = self._cfg("filter_prompt", "").strip()
+            if filter_prompt:
+                ok = await self._semantic_filter(sample_text, filter_prompt)
+                if not ok:
+                    logger.info(
+                        f"[StyleLearner] 语义审核未通过，跳过自动分析 [{skill_name}]")
+                    return
+
+            result = await self._analyze_style(sample_text)
+
+            skill_data = {
+                "label": result.get("label", skill_name),
+                "summary": result.get("summary", ""),
+                "examples": sampled[:10],
+                "source_file": "@active_learning",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "auto_update": True,
+                "buffer_count": len(self._buffer),
+            }
+
+            async with self._skills_lock:
+                self._skills[skill_name] = skill_data
+            await self._save_skills()
+
+            logger.info(
+                f"[StyleLearner] 自动分析完成: [{skill_name}] "
+                f"标签={result.get('label')}, buffer={len(self._buffer)}条")
+        except Exception as e:
+            logger.error(f"[StyleLearner] 自动分析失败 [{skill_name}]: {e}", exc_info=True)
+
+    async def _semantic_filter(self, sample_text: str, custom_prompt: str) -> bool:
+        """用 DeepSeek 做语义审核，返回 True 表示通过"""
+        system_prompt = (
+            "你是一个内容安全审核助手。请判断以下对话样本是否包含"
+            "涉政、色情、暴力或其他严重违规内容。只输出 PASS 或 FAIL。"
+        )
+        user_prompt = f"{custom_prompt}\n\n对话样本:\n{sample_text[:3000]}"
+        try:
+            resp = await self._call_llm(
+                system_prompt, user_prompt, max_tokens=16, temperature=0.1)
+            return "PASS" in resp.upper()
+        except Exception:
+            # API 调用失败时不阻塞学习流程
+            return True
 
     # ==================== Persistence ====================
 
@@ -105,6 +305,34 @@ class StyleLearner(Star):
                     self.skills_file.write_text, data, encoding="utf-8")
             except Exception as e:
                 logger.error(f"[StyleLearner] 保存 skills.json 失败: {e}")
+
+    async def _load_buffer(self):
+        """从 active_buffer.jsonl 恢复 ring buffer"""
+        try:
+            if self.buffer_file.exists():
+                raw = await asyncio.to_thread(
+                    self.buffer_file.read_text, encoding="utf-8")
+                for line in raw.strip().split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                        self._buffer.append(item)
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as e:
+            logger.error(f"[StyleLearner] 加载 buffer 失败: {e}")
+
+    async def _save_buffer_item(self, item: dict):
+        """追加一条对话到 active_buffer.jsonl"""
+        def _write():
+            with self.buffer_file.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        try:
+            await asyncio.to_thread(_write)
+        except Exception as e:
+            logger.debug(f"[StyleLearner] buffer 持久化失败: {e}")
 
     # ==================== LLM ====================
 
@@ -445,6 +673,119 @@ class StyleLearner(Star):
         except Exception as e:
             logger.error(f"[StyleLearner] /skupdate 失败: {e}", exc_info=True)
             yield event.plain_result(f"更新失败: {e}")
+
+    # ==================== /sklearn_active ====================
+
+    @filter.command("sklearn_active")
+    async def sklearn_active(self, event: AstrMessageEvent):
+        """手动从当前 buffer 创建技能。用法: /sklearn_active <技能名> [数量]"""
+        msg = event.get_message_str().strip()
+        args = msg[len("/sklearn_active"):].strip().split()
+        if not args:
+            yield event.plain_result(
+                "用法: /sklearn_active <技能名> [数量]\n"
+                "例如: /sklearn_active @全局 30")
+            return
+
+        skill_name = args[0]
+        count = int(args[1]) if len(args) > 1 else int(self._cfg("batch_size", 30))
+
+        if not self._buffer:
+            yield event.plain_result("Buffer 为空，没有对话数据。请先开启主动学习并聊天。")
+            return
+
+        yield event.plain_result(f"正在从 buffer ({len(self._buffer)}条) 分析 [{skill_name}]，请稍候...")
+
+        try:
+            pool = list(self._buffer)[-count:]
+            sampled = []
+            total_chars = 0
+            max_chars = int(self._cfg("max_sample_chars", 3000))
+            for item in reversed(pool):
+                text = f"{item['user_msg']}|||{item['bot_msg']}"
+                if total_chars + len(text) > max_chars and sampled:
+                    break
+                sampled.append([item["user_msg"], item["bot_msg"]])
+                total_chars += len(text)
+
+            sample_text = "\n".join(f"{s[0]}|||{s[1]}" for s in sampled)
+            result = await self._analyze_style(sample_text)
+
+            skill_data = {
+                "label": result.get("label", skill_name),
+                "summary": result.get("summary", ""),
+                "examples": sampled[:10],
+                "source_file": "@active_learning",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "auto_update": True,
+                "buffer_count": len(self._buffer),
+            }
+
+            async with self._skills_lock:
+                self._skills[skill_name] = skill_data
+            await self._save_skills()
+
+            yield event.plain_result(
+                f"技能 [{skill_name}] 创建完成！\n"
+                f"风格标签: {skill_data['label']}\n"
+                f"风格描述: {skill_data['summary']}\n"
+                f"使用 {len(sampled)} 条对话样本")
+        except Exception as e:
+            logger.error(f"[StyleLearner] /sklearn_active 失败: {e}", exc_info=True)
+            yield event.plain_result(f"学习失败: {e}")
+
+    # ==================== /skbuffer ====================
+
+    @filter.command("skbuffer")
+    async def skbuffer(self, event: AstrMessageEvent):
+        """查看当前 buffer 状态。用法: /skbuffer"""
+        mode = self._cfg("active_learning_mode", "off")
+        if mode == "off":
+            yield event.plain_result("主动学习已关闭。在 WebUI 中开启后自动积累对话数据。")
+            return
+
+        skill_name = self._active_skill_name()
+        batch_size = int(self._cfg("batch_size", 30))
+
+        # 按 sender 统计
+        sender_counts: dict[str, int] = {}
+        for item in self._buffer:
+            s = item.get("sender", "unknown")
+            sender_counts[s] = sender_counts.get(s, 0) + 1
+
+        lines = [
+            f"主动学习模式: {mode}",
+            f"目标技能名: {skill_name}",
+            f"Buffer 总量: {len(self._buffer)} / 自动分析阈值: {batch_size}",
+            f"进度: {min(len(self._buffer), batch_size)}/{batch_size} ({min(100, int(len(self._buffer)/batch_size*100))}%)",
+            "\n按发送者统计:",
+        ]
+        for s, c in sorted(sender_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"  {s}: {c} 条")
+
+        yield event.plain_result("\n".join(lines))
+
+    # ==================== /skbuffer_clear ====================
+
+    @filter.command("skbuffer_clear")
+    async def skbuffer_clear(self, event: AstrMessageEvent):
+        """清空 buffer。用法: /skbuffer_clear [技能名]（不指定则清空全部）"""
+        msg = event.get_message_str().strip()
+        arg = msg[len("/skbuffer_clear"):].strip()
+
+        count = len(self._buffer)
+        self._buffer.clear()
+        self._pending.clear()
+        self._last_auto_analyze_count = 0
+
+        # 清空 buffer 文件
+        try:
+            await asyncio.to_thread(
+                lambda: self.buffer_file.write_text("", encoding="utf-8"))
+        except Exception:
+            pass
+
+        yield event.plain_result(f"已清空 buffer（原 {count} 条对话）。")
 
     # ==================== Helpers ====================
 

@@ -1,13 +1,15 @@
 # AstrBot Style Learner
 
-**从对话记录中学习说话风格，让 AI 模仿任何人说话。**
+**从对话记录学习说话风格，让 AI 模仿任何人说话。**
 
 > 本插件由 AI (DeepSeek-V4-Pro) 生成。
 
 ## 功能
 
 - 从 `.jsonl` 对话文件自动分析并提取说话风格
+- **主动学习**：在日常聊天中自动积累对话数据，无需手动导入文件
 - 支持风格混合（多个风格按权重组合）
+- 消息过滤：防止敏感信息污染数据集（默认开启，可自定义关键词）
 - 自动记录模仿输出到反馈日志，方便后续优化
 - 所有配置通过 AstrBot WebUI 暴露，开箱即用
 
@@ -36,6 +38,9 @@ pip install -r requirements.txt
 | `/skdelete` | `/skdelete <技能名>` | 删除一个技能 |
 | `/skinfo` | `/skinfo <技能名>` | 查看技能详情（标签、描述、示例数等） |
 | `/skupdate` | `/skupdate <技能名> [新路径]` | 更新技能（不指定路径则用原文件） |
+| `/sklearn_active` | `/sklearn_active <技能名> [数量]` | 从聊天 buffer 手动创建技能 |
+| `/skbuffer` | `/skbuffer` | 查看 buffer 积累状态 |
+| `/skbuffer_clear` | `/skbuffer_clear` | 清空 buffer |
 
 ### 风格混合
 
@@ -45,7 +50,50 @@ pip install -r requirements.txt
 /imitate 温柔学姐:0.3+沙雕群友:0.7 今天天气真好
 ```
 
-### 数据格式
+## 主动学习
+
+开启后，插件会在日常聊天中自动积累对话数据，达到阈值后自动分析并创建技能。
+
+### 三种模式
+
+| 模式 | 说明 |
+|------|------|
+| `off` (关闭) | 不做主动学习，仅响应手动命令 |
+| `all` (学习所有人) | 收集所有用户消息，创建技能 `@全局` |
+| `specific` (指定用户) | 仅收集指定 QQ 号的消息，创建技能 `@<QQ号>` |
+
+### 消息过滤
+
+为防止涉政、色情等敏感内容污染数据集，插件内置关键词过滤（默认开启）。
+
+在 WebUI 中可：
+- 关闭过滤（`启用消息过滤` → false）
+- 自定义关键词列表（`过滤关键词`，逗号分隔）
+- 开启语义审核（`语义审核 Prompt`，填写后每次分析前调 DeepSeek 审核，消耗 token）
+
+### 使用示例
+
+```bash
+# 在 WebUI 中将 主动学习模式 设为 all
+# 然后正常聊天...
+
+# 查看 buffer 积累进度
+/skbuffer
+# → 主动学习模式: all
+# → 目标技能名: @全局
+# → Buffer 总量: 25 / 自动分析阈值: 30
+# → 按发送者统计:
+# →   12345678: 15 条
+# →   87654321: 10 条
+
+# 满了自动分析，或手动触发
+/sklearn_active @全局 30
+
+# 模仿学到的全局风格
+/imitate @全局 你在干嘛呢
+```
+
+## 数据格式
 
 对话数据为 `.jsonl` 文件（也支持 `.jsonl.gz`），每行一个 JSON 数组：
 
@@ -76,6 +124,13 @@ gunzip lccc_base_test.jsonl.gz
 | `deepseek_model` | `deepseek-chat` | 使用的模型名称 |
 | `deepseek_base_url` | `https://api.deepseek.com` | API 地址 |
 | `max_sample_chars` | `3000` | 学习时单次最大采样字符数 |
+| `active_learning_mode` | `off` | 主动学习模式: off / all / specific |
+| `specific_qq` | (空) | specific 模式下指定的 QQ 号 |
+| `batch_size` | `30` | buffer 满多少条后自动分析 |
+| `enable_message_filter` | `true` | 是否启用关键词过滤 |
+| `filter_keywords` | (预置) | 过滤关键词，逗号分隔 |
+| `filter_prompt` | (空) | 语义审核 prompt（留空关闭） |
+| `show_filter_notice` | `false` | 是否显示隐私提示 |
 
 ## 文件结构
 
@@ -85,6 +140,7 @@ astrbot_plugin_style_learner/
 ├── metadata.yaml        # 插件元数据
 ├── requirements.txt     # 依赖
 ├── skills.json          # 技能数据（自动生成）
+├── active_buffer.jsonl  # 主动学习 buffer（自动生成）
 └── feedback_log.jsonl   # 模仿反馈日志（自动生成）
 ```
 
