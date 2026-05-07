@@ -1,17 +1,17 @@
 {
   "deepseek_api_key": {
     "description": "DeepSeek API 密钥（必填）",
-    "type": "str",
+    "type": "string",
     "default": ""
   },
   "deepseek_model": {
     "description": "使用的 DeepSeek 模型名称",
-    "type": "str",
+    "type": "string",
     "default": "deepseek-chat"
   },
   "deepseek_base_url": {
     "description": "DeepSeek API 地址",
-    "type": "str",
+    "type": "string",
     "default": "https://api.deepseek.com"
   },
   "max_sample_chars": {
@@ -21,12 +21,12 @@
   },
   "active_learning_mode": {
     "description": "主动学习模式: off=关闭 / all=学习所有人 / specific=学习指定用户",
-    "type": "str",
+    "type": "string",
     "default": "off"
   },
   "specific_qq": {
     "description": "当主动学习模式为 specific 时，指定要学习的 QQ 号",
-    "type": "str",
+    "type": "string",
     "default": ""
   },
   "batch_size": {
@@ -41,12 +41,12 @@
   },
   "filter_keywords": {
     "description": "过滤关键词，逗号分隔。命中任意关键词的消息将被跳过",
-    "type": "str",
+    "type": "string",
     "default": "习近平,习总书记,国务院,共产党,台独,港独,六四,法轮功,裸体,做爱,性交,色情,黄色,成人网站,赌博,赌场"
   },
   "filter_prompt": {
     "description": "语义审核 prompt（留空则不启用，填写后每次分析前调 DeepSeek 做语义审核）",
-    "type": "str",
+    "type": "string",
     "default": ""
   },
   "show_filter_notice": {
@@ -56,7 +56,7 @@
   },
   "default_skill": {
     "description": "默认风格技能名，留空关闭。填写后所有消息自动以该风格回复（持续扮演优先）",
-    "type": "str",
+    "type": "string",
     "default": ""
   }
 }
