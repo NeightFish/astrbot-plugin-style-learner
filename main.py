@@ -34,7 +34,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from quart import request
+from quart import request, Response
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import File
@@ -128,6 +128,12 @@ class StyleLearner(Star):
     async def initialize(self):
         await self._load_skills()
         await self._load_buffer()
+        self.context.register_web_api(
+            "/astrbot_plugin_style_learner/upload-page",
+            self._handle_upload_page,
+            ["GET"],
+            "WebUI 文件上传页面",
+        )
         self.context.register_web_api(
             "/astrbot_plugin_style_learner/upload",
             self._handle_upload,
@@ -1190,6 +1196,14 @@ class StyleLearner(Star):
         except Exception as e:
             logger.error(f"[StyleLearner] 读取文件失败: {e}")
         return conversations
+
+    async def _handle_upload_page(self):
+        """返回 WebUI 上传页面"""
+        html_path = self.plugin_dir / "pages" / "upload.html"
+        if not html_path.exists():
+            return Response("<h1>上传页面未找到</h1>", status=404, mimetype="text/html")
+        content = await asyncio.to_thread(html_path.read_text, encoding="utf-8")
+        return Response(content, mimetype="text/html")
 
     async def _handle_upload(self) -> dict:
         """处理 .jsonl 文件上传 → 学习风格 → 删除临时文件"""

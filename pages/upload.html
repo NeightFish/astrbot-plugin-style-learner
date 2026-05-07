@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>风格学习 - 上传文件</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: #f5f5f5;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .container {
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+    padding: 40px;
+    max-width: 520px;
+    width: 100%;
+  }
+  h1 {
+    font-size: 22px;
+    font-weight: 600;
+    color: #1a1a1a;
+    margin-bottom: 8px;
+  }
+  .subtitle {
+    font-size: 14px;
+    color: #888;
+    margin-bottom: 28px;
+  }
+  .drop-zone {
+    border: 2px dashed #d0d0d0;
+    border-radius: 10px;
+    padding: 40px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+    margin-bottom: 20px;
+  }
+  .drop-zone:hover, .drop-zone.drag-over {
+    border-color: #4a90d9;
+    background: #f0f6ff;
+  }
+  .drop-zone.has-file {
+    border-color: #4caf50;
+    background: #f1f8f1;
+  }
+  .drop-icon {
+    font-size: 40px;
+    margin-bottom: 10px;
+    color: #bbb;
+  }
+  .drop-zone.has-file .drop-icon { color: #4caf50; }
+  .drop-text {
+    font-size: 15px;
+    color: #666;
+  }
+  .drop-hint {
+    font-size: 13px;
+    color: #aaa;
+    margin-top: 6px;
+  }
+  .file-name {
+    font-size: 14px;
+    font-weight: 500;
+    color: #2e7d32;
+    margin-top: 8px;
+    word-break: break-all;
+  }
+  .form-group {
+    margin-bottom: 20px;
+  }
+  .form-group label {
+    display: block;
+    font-size: 14px;
+    font-weight: 500;
+    color: #333;
+    margin-bottom: 6px;
+  }
+  .form-group input {
+    width: 100%;
+    padding: 10px 14px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    font-size: 15px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  .form-group input:focus {
+    border-color: #4a90d9;
+    box-shadow: 0 0 0 3px rgba(74,144,217,0.1);
+  }
+  .btn {
+    width: 100%;
+    padding: 12px;
+    border: none;
+    border-radius: 8px;
+    font-size: 16px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s, opacity 0.2s;
+  }
+  .btn-primary {
+    background: #4a90d9;
+    color: #fff;
+  }
+  .btn-primary:hover { background: #3a7bc8; }
+  .btn-primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .btn-reset {
+    background: #f0f0f0;
+    color: #555;
+    margin-top: 10px;
+  }
+  .btn-reset:hover { background: #e0e0e0; }
+  .result {
+    margin-top: 24px;
+    padding: 16px;
+    border-radius: 8px;
+    display: none;
+  }
+  .result.show { display: block; }
+  .result.success {
+    background: #e8f5e9;
+    border: 1px solid #c8e6c9;
+  }
+  .result.error {
+    background: #ffebee;
+    border: 1px solid #ffcdd2;
+  }
+  .result-title {
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .result.success .result-title { color: #2e7d32; }
+  .result.error .result-title { color: #c62828; }
+  .result-body {
+    font-size: 14px;
+    color: #555;
+    line-height: 1.6;
+  }
+  .result-label {
+    font-size: 12px;
+    color: #888;
+    margin-top: 8px;
+  }
+  .spinner {
+    display: none;
+    width: 20px;
+    height: 20px;
+    border: 2px solid #fff;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  .btn-primary.loading .spinner { display: inline-block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>风格学习 - 上传对话文件</h1>
+  <p class="subtitle">上传 .jsonl 对话文件，让 AI 学习说话风格</p>
+
+  <div class="drop-zone" id="dropZone">
+    <div class="drop-icon" id="dropIcon">📂</div>
+    <div class="drop-text">拖拽 .jsonl 文件到此处</div>
+    <div class="drop-hint">或点击选择文件（支持 .jsonl / .jsonl.gz / .gz）</div>
+    <div class="file-name" id="fileName"></div>
+  </div>
+  <input type="file" id="fileInput" accept=".jsonl,.gz" style="display:none">
+
+  <div class="form-group">
+    <label for="skillName">技能名称</label>
+    <input type="text" id="skillName" placeholder="给这个风格起个名字，例如：小明、客服风格" autocomplete="off">
+  </div>
+
+  <button class="btn btn-primary" id="uploadBtn" disabled>
+    <span class="spinner"></span>上传并学习
+  </button>
+  <button class="btn btn-reset" id="resetBtn" style="display:none">继续上传</button>
+
+  <div class="result" id="result">
+    <div class="result-title" id="resultTitle"></div>
+    <div class="result-body" id="resultBody"></div>
+  </div>
+</div>
+
+<script>
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const fileName = document.getElementById('fileName');
+const dropIcon = document.getElementById('dropIcon');
+const skillName = document.getElementById('skillName');
+const uploadBtn = document.getElementById('uploadBtn');
+const resetBtn = document.getElementById('resetBtn');
+const result = document.getElementById('result');
+const resultTitle = document.getElementById('resultTitle');
+const resultBody = document.getElementById('resultBody');
+
+let selectedFile = null;
+
+const UPLOAD_URL = '/api/plug/astrbot_plugin_style_learner/upload';
+
+function validateFile(file) {
+  const name = file.name.toLowerCase();
+  return name.endsWith('.jsonl') || name.endsWith('.jsonl.gz') || name.endsWith('.gz');
+}
+
+function selectFile(file) {
+  if (!validateFile(file)) {
+    showResult(false, '文件格式不支持', '只接受 .jsonl、.jsonl.gz 或 .gz 格式的对话文件。');
+    return;
+  }
+  selectedFile = file;
+  fileName.textContent = file.name;
+  dropZone.classList.add('has-file');
+  dropIcon.textContent = '✅';
+  updateUploadBtn();
+}
+
+function updateUploadBtn() {
+  uploadBtn.disabled = !(selectedFile && skillName.value.trim());
+}
+
+dropZone.addEventListener('click', () => fileInput.click());
+
+dropZone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  dropZone.classList.add('drag-over');
+});
+
+dropZone.addEventListener('dragleave', () => {
+  dropZone.classList.remove('drag-over');
+});
+
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file) selectFile(file);
+});
+
+fileInput.addEventListener('change', () => {
+  const file = fileInput.files[0];
+  if (file) selectFile(file);
+});
+
+skillName.addEventListener('input', updateUploadBtn);
+
+uploadBtn.addEventListener('click', async () => {
+  if (!selectedFile || !skillName.value.trim()) return;
+
+  uploadBtn.classList.add('loading');
+  uploadBtn.disabled = true;
+  result.classList.remove('show');
+
+  try {
+    const formData = new FormData();
+    formData.append('file', selectedFile);
+    formData.append('skill_name', skillName.value.trim());
+
+    const resp = await fetch(UPLOAD_URL, { method: 'POST', body: formData });
+    const data = await resp.json();
+
+    if (data.ok) {
+      showResult(true, '学习完成！',
+        `<strong>技能名：</strong>${data.skill_name}<br>` +
+        `<strong>风格标签：</strong>${data.label}<br>` +
+        `<strong>摘要：</strong>${data.summary || '无'}`);
+    } else {
+      showResult(false, '上传失败', data.error || '未知错误');
+    }
+  } catch (err) {
+    showResult(false, '请求失败', '网络错误或服务器未响应，请检查连接。');
+  } finally {
+    uploadBtn.classList.remove('loading');
+    uploadBtn.disabled = true;
+  }
+});
+
+resetBtn.addEventListener('click', () => {
+  selectedFile = null;
+  fileInput.value = '';
+  fileName.textContent = '';
+  skillName.value = '';
+  dropZone.classList.remove('has-file');
+  dropIcon.textContent = '📂';
+  result.classList.remove('show');
+  uploadBtn.disabled = true;
+  uploadBtn.classList.remove('loading');
+  resetBtn.style.display = 'none';
+});
+
+function showResult(ok, title, body) {
+  result.classList.remove('success', 'error', 'show');
+  result.classList.add(ok ? 'success' : 'error', 'show');
+  resultTitle.textContent = ok ? '✓ ' + title : '✗ ' + title;
+  resultBody.innerHTML = body;
+  if (ok) {
+    uploadBtn.style.display = 'none';
+    resetBtn.style.display = 'block';
+  } else {
+    uploadBtn.style.display = '';
+    uploadBtn.disabled = false;
+    resetBtn.style.display = 'none';
+  }
+}
+</script>
+</body>
+</html>
