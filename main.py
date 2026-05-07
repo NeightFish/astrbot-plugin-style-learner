@@ -29,10 +29,12 @@ import json
 import math
 import random
 import re
+import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from quart import request
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
@@ -125,6 +127,12 @@ class StyleLearner(Star):
     async def initialize(self):
         await self._load_skills()
         await self._load_buffer()
+        self.context.register_web_api(
+            "/astrbot_plugin_style_learner/upload",
+            self._handle_upload,
+            ["POST"],
+            "上传 .jsonl 文件学习风格",
+        )
         logger.info(
             f"[StyleLearner] 已加载 {len(self._skills)} 个技能, "
             f"buffer 中有 {len(self._buffer)} 条对话")
@@ -1127,6 +1135,99 @@ class StyleLearner(Star):
 
         scored.sort(key=lambda x: -x[0])
         return [raw for _, raw in scored[:top_k]]
+
+    async def _read_jsonl(self, path: Path) -> list[list[str]]:
+        conversations = []
+        try:
+            if path.suffix == ".gz":
+                import gzip
+                raw = await asyncio.to_thread(
+                    lambda: gzip.decompress(path.read_bytes()).decode("utf-8"))
+            else:
+                raw = await asyncio.to_thread(path.read_text, encoding="utf-8")
+
+            for line in raw.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, list) and len(data) >= 2:
+                        if all(isinstance(x, list) for x in data):
+                            flat = []
+                            for item in data:
+                                if isinstance(item, list):
+                                    flat.extend(item)
+                                else:
+                                    flat.append(item)
+                            if len(flat) >= 2:
+                                conversations.append(flat)
+                        else:
+                            conversations.append(data)
+                except json.JSONDecodeError:
+                    continue
+        except Exception as e:
+            logger.error(f"[StyleLearner] 读取文件失败: {e}")
+        return conversations
+
+    async def _handle_upload(self) -> dict:
+        """处理 .jsonl 文件上传 → 学习风格 → 删除临时文件"""
+        files = await request.files
+        if "file" not in files:
+            return {"ok": False, "error": "没有上传文件"}
+        uploaded = files["file"]
+        filename = (uploaded.filename or "upload.jsonl").lower()
+        if not (filename.endswith(".jsonl") or filename.endswith(".jsonl.gz") or filename.endswith(".gz")):
+            return {"ok": False, "error": "只支持 .jsonl 或 .jsonl.gz 文件"}
+
+        form = await request.form
+        skill_name = (form.get("skill_name") or "").strip()
+        if not skill_name:
+            return {"ok": False, "error": "缺少 skill_name 参数"}
+        if skill_name in self._skills:
+            return {"ok": False, "error": f"技能 {skill_name} 已存在"}
+
+        upload_dir = self.plugin_dir / "uploads"
+        upload_dir.mkdir(exist_ok=True)
+        tmp_path = upload_dir / f"{uuid.uuid4().hex}_{filename}"
+
+        try:
+            content = uploaded.read()
+            await asyncio.to_thread(tmp_path.write_bytes, content)
+        except Exception as e:
+            return {"ok": False, "error": f"保存文件失败: {e}"}
+
+        try:
+            conversations = await self._read_jsonl(tmp_path)
+            if not conversations:
+                return {"ok": False, "error": "文件中没有有效的对话数据"}
+
+            sampled = self._sample_conversations(conversations)
+            sample_text = self._format_samples(sampled)
+            analysis = await self._analyze_style(sample_text)
+
+            skill = {
+                "label": analysis.get("label", skill_name),
+                "summary": analysis.get("summary", ""),
+                "examples": conversations,
+                "source_file": filename,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "usage_count": 0,
+            }
+            self._skills[skill_name] = skill
+            await self._save_skills()
+
+            return {
+                "ok": True,
+                "skill_name": skill_name,
+                "label": skill["label"],
+                "summary": skill["summary"],
+            }
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _sample_conversations(self, conversations: list[list[str]]) -> list[list[str]]:
         max_chars = int(self._cfg("max_sample_chars", 3000))
