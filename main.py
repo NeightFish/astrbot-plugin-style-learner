@@ -1129,39 +1129,6 @@ class StyleLearner(Star):
 
         scored.sort(key=lambda x: -x[0])
         return [raw for _, raw in scored[:top_k]]
-        conversations = []
-        try:
-            if path.suffix == ".gz":
-                import gzip
-                raw = await asyncio.to_thread(
-                    lambda: gzip.decompress(path.read_bytes()).decode("utf-8"))
-            else:
-                raw = await asyncio.to_thread(path.read_text, encoding="utf-8")
-
-            for line in raw.strip().split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    if isinstance(data, list) and len(data) >= 2:
-                        # Handle LCCC format: [[s1,s2], [s3,s4], ...]
-                        if all(isinstance(x, list) for x in data):
-                            flat = []
-                            for item in data:
-                                if isinstance(item, list):
-                                    flat.extend(item)
-                                else:
-                                    flat.append(item)
-                            if len(flat) >= 2:
-                                conversations.append(flat)
-                        else:
-                            conversations.append(data)
-                except json.JSONDecodeError:
-                    continue
-        except Exception as e:
-            logger.error(f"[StyleLearner] 读取文件失败: {e}")
-        return conversations
 
     def _sample_conversations(self, conversations: list[list[str]]) -> list[list[str]]:
         max_chars = int(self._cfg("max_sample_chars", 3000))
