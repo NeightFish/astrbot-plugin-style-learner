@@ -37,6 +37,7 @@ from pathlib import Path
 from quart import request
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import File
 from astrbot.api.star import Context, Star, register
 from astrbot.core.agent.message import TextPart
 from astrbot.core.star.config import put_config
@@ -440,17 +441,19 @@ class StyleLearner(Star):
 
     @filter.command("sklearn")
     async def sklearn(self, event: AstrMessageEvent):
-        """从 .jsonl 文件学习风格。用法: /sklearn <技能名> <文件路径>"""
+        """从 .jsonl 文件学习风格。用法: /sklearn <技能名> [文件路径]
+        不指定路径时自动从聊天附件中读取 .jsonl 文件。"""
         msg = event.get_message_str().strip()
         args = msg[len("/sklearn"):].strip().split(" ", 1)
-        if len(args) < 2 or not args[0] or not args[1]:
+
+        if not args or not args[0]:
             yield event.plain_result(
-                "用法: /sklearn <技能名> <文件路径>\n"
-                "例如: /sklearn 温柔学姐 D:/data/style.jsonl")
+                "用法: /sklearn <技能名> [文件路径]\n"
+                "不指定路径时请在聊天框上传 .jsonl 文件作为附件。\n"
+                "例如: /sklearn 温柔学姐")
             return
 
         skill_name = args[0]
-        file_path = args[1].strip()
 
         if skill_name in self._skills:
             yield event.plain_result(
@@ -458,10 +461,28 @@ class StyleLearner(Star):
                 f"如需重新学习请先用 /skdelete {skill_name} 删除。")
             return
 
-        path = Path(file_path)
-        if not path.exists():
-            yield event.plain_result(f"文件不存在: {file_path}")
-            return
+        # 解析文件来源：优先用参数路径，否则从聊天附件获取
+        if len(args) >= 2 and args[1].strip():
+            path = Path(args[1].strip())
+            if not path.exists():
+                yield event.plain_result(f"文件不存在: {args[1]}")
+                return
+        else:
+            # 从消息附件中查找 .jsonl 或 .gz 文件
+            attached = [
+                c for c in event.get_messages()
+                if isinstance(c, File) and c.name
+                and (c.name.lower().endswith(".jsonl")
+                     or c.name.lower().endswith(".jsonl.gz")
+                     or c.name.lower().endswith(".gz"))
+            ]
+            if not attached:
+                yield event.plain_result(
+                    "未指定文件路径，且消息中没有 .jsonl 附件。\n"
+                    "请在聊天框上传 .jsonl 文件后重新发送此命令，\n"
+                    "或使用: /sklearn <技能名> <文件路径>")
+                return
+            path = Path(await attached[0].get_file())
 
         yield event.plain_result(f"正在分析 [{skill_name}] 的对话风格，请稍候...")
 
