@@ -1,5 +1,5 @@
 name: astrbot_plugin_style_learner
 desc: 从对话记录学习说话风格，支持持续扮演、风格混合、主动学习与使用统计。由 AI (DeepSeek-V4-Pro) 生成。
-version: 1.2.0
+version: 1.2.1
 author: AI Generated (DeepSeek-V4-Pro)
 repo: https://github.com/NeightFish/astrbot-plugin-style-learner

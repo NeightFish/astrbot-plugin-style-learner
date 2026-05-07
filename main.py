@@ -116,10 +116,8 @@ class StyleLearner(Star):
                    "", "留空则不启用。填写技能名后，所有消息自动以该风格回复（持续扮演优先）")
 
     def _cfg(self, key, default=None):
-        if self.config and hasattr(self.config, key):
-            v = getattr(self.config, key)
-            if v is not None:
-                return v
+        if self.config is not None:
+            return self.config.get(key, default)
         return default
 
     # ==================== Lifecycle ====================
